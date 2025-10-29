@@ -142,6 +142,8 @@ static TEE_Result virtio_area_unshare(uint16_t area_id)
 	state = cpu_spin_lock_xsave(&areas_lock);
 	a = find_virtio_area(area_id);
 	if (a) {
+		mobj_put(a->mobj);
+
 		res = mobj_ffa_unregister_by_cookie(a->handle);
 		if (!res || res == TEE_ERROR_ITEM_NOT_FOUND)
 			TAILQ_REMOVE(&areas_head, a, link);

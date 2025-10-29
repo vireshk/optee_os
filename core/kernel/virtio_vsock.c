@@ -57,11 +57,44 @@ enum virtio_vsock_vq_idx {
 #define VIRTIO_VSOCK_OP_CREDIT_UPDATE	6
 /* Request the peer to send the credit info to us */
 #define VIRTIO_VSOCK_OP_CREDIT_REQUEST	7
+/* Share memory with the peer */
+#define VIRTIO_VSOCK_OP_SHMEM		8
 
 #define VIRTIO_VSOCK_SHUTDOWN_F_RECEIVE	0
 #define VIRTIO_VSOCK_SHUTDOWN_F_SEND	1
 
 #define VIRTIO_VSOCK_CID_HOST		2
+
+/* Ancillary message types (SOL_VSOCK cmsg) */
+#define SCM_VSOCK_SHMEM			1
+
+/* SHMEM control constants (userspace) */
+#define VSOCK_SHMEM_SUBOP_OFFER		0
+#define VSOCK_SHMEM_SUBOP_RELINQUISH	1
+#define VSOCK_SHMEM_SUBOP_RECLAIM	2
+
+#define VSOCK_SHMEM_TYPE_FFA		1
+
+struct vsock_shmem_desc_payload_dma_buf_sg {
+	uint64_t addr;
+	uint32_t len;
+} __packed;
+
+struct vsock_shmem_desc_payload_dma_buf {
+	uint32_t nents;
+	struct vsock_shmem_desc_payload_dma_buf_sg sgs[];
+} __packed;
+
+/*
+ * Userspace-visible descriptor transferred as ancillary cmsg payload and
+ * carried as payload for VIRTIO_VSOCK_OP_SHMEM control packet.
+ */
+struct vsock_shmem_desc {
+	uint32_t subop; /* VSOCK_SHMEM_SUBOP_* */
+	uint32_t type; /* VSOCK_SHMEM_TYPE_* */
+	uint32_t len; /* Length of this descriptor including payload */
+	struct vsock_shmem_desc_payload_dma_buf payload;
+} __packed;
 
 static const struct virtio_description vsock_desc;
 static const uint8_t vsock_features[] = {
@@ -447,6 +480,68 @@ static void handle_op_rst(struct virtq_read_ctx *vqr,
 	virtq_write_finish(&wbuf, sizeof(resp));
 }
 
+static void handle_op_shmem(struct virtq_read_ctx *vqr,
+			    struct virtio_vsock_hdr *req)
+{
+	struct vsock_shmem_desc_payload_dma_buf_sg *sg;
+	struct virtio_vsock_socket *vvs;
+	struct vsock_shmem_desc *desc;
+	TEE_Result res;
+	void *src;
+	unsigned int i;
+
+	vvs = find_socket2(req->src_cid, req->dst_cid, req->src_port,
+			   req->dst_port, req->type);
+	if (!vvs) {
+		/* Connection not found */
+		DMSG("Connection not found");
+		return;
+	}
+
+	if (req->len <= sizeof(*desc)) {
+		DMSG("Invalid descriptor size: %#"PRIx32, req->len);
+		return;
+	}
+
+	desc = calloc(1, req->len);
+	if (!desc) {
+		DMSG("Failed to allocate desc");
+		return;
+	}
+
+	res = virtq_read_copy((void *)desc, vqr, sizeof(*req), req->len);
+	if (res) {
+		DMSG("virtq_read_copy: res %#"PRIx32, res);
+		return;
+	}
+
+	if (desc->type != VSOCK_SHMEM_TYPE_FFA) {
+		DMSG("Invalid descriptor type");
+		return;
+	}
+
+	if (desc->subop == VSOCK_SHMEM_SUBOP_RECLAIM) {
+		DMSG("Virtio SHMEM memory unshared\n");
+		return;
+	}
+
+	for (i = 0; i < desc->payload.nents; i++) {
+		sg = &desc->payload.sgs[i];
+		res = virtio_bus_addr_inc_map(sg->addr);
+		if (res)
+			return;
+
+		src = virtio_bus_addr_to_virt(sg->addr, sg->len);
+		if (src)
+			DMSG("Virtio SHMEM memory shared, message: %s\n", (char *)src);
+		else
+			DMSG("Virtio SHMEM Failed: Handle %#"PRIx64" size %#"PRIx32, sg->addr, sg->len);
+
+		virtio_bus_addr_dec_map(sg->addr);
+	}
+	free(desc);
+}
+
 static void handle_rx_payload(struct virtq_read_ctx *vqr)
 {
 	struct virtio_vsock_hdr hdr = { };
@@ -490,6 +585,10 @@ static void handle_rx_payload(struct virtq_read_ctx *vqr)
 	case VIRTIO_VSOCK_OP_CREDIT_REQUEST:
 		DMSG("VIRTIO_VSOCK_OP_CREDIT_REQUEST");
 		handle_op_credit_request(vqr, &hdr);
+		break;
+	case VIRTIO_VSOCK_OP_SHMEM:
+		DMSG("VIRTIO_VSOCK_OP_SHMEM");
+		handle_op_shmem(vqr, &hdr);
 		break;
 	default:
 		DMSG("Unknown op %"PRIu16, hdr.op);
